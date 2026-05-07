@@ -3,7 +3,7 @@ import re
 import pickle
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -245,6 +245,94 @@ class RiskGatedLSTMClassifier(nn.Module):
         return self.out(rep).squeeze(-1)
 
 
+
+
+def rule_based_probability(text: str) -> float:
+    t = text.lower()
+    signals = [
+        any(k in t for k in SQL_KEYWORDS),
+        any(tok in t for tok in COMMENT_TOKENS),
+        bool(re.search(r"\b(or|and)\b\s+[\"'0-9a-z_]+\s*=\s+[\"'0-9a-z_]+", t)),
+        "union select" in t,
+    ]
+    score = sum(signals) / len(signals)
+    return float(min(max(score, 0.0), 1.0))
+
+
+class TinyDQN(nn.Module):
+    def __init__(self, state_dim: int, hidden: int = 64, n_actions: int = 3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, n_actions),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def build_dqn_states(texts: List[str], probs_dict: dict) -> np.ndarray:
+    rows = []
+    for i, text in enumerate(texts):
+        gf = global_features(text)
+        rule = probs_dict["RULE"][i]
+        svm = probs_dict["TFIDF_SVM"][i]
+        rf = probs_dict["TFIDF_RF"][i]
+        textcnn = probs_dict["LSTM_base"][i]
+        bilstm = probs_dict["RiskGatedLSTM_Attn"][i]
+        rows.append([rule, svm, rf, textcnn, bilstm, *gf.tolist()])
+    return np.asarray(rows, dtype=np.float32)
+
+
+def dqn_reward(action: int, label: int) -> float:
+    if action == 0 and label == 0:
+        return 1.0
+    if action == 2 and label == 1:
+        return 3.0
+    if action == 2 and label == 0:
+        return -2.0
+    if action == 0 and label == 1:
+        return -4.0
+    if action == 1 and label == 1:
+        return 1.0
+    return -0.3
+
+
+def train_dqn_policy(states: np.ndarray, labels: np.ndarray, epochs: int = 40, gamma: float = 0.95) -> TinyDQN:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = TinyDQN(state_dim=states.shape[1]).to(device)
+    target = TinyDQN(state_dim=states.shape[1]).to(device)
+    target.load_state_dict(model.state_dict())
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    s = torch.tensor(states, dtype=torch.float32, device=device)
+    y = torch.tensor(labels, dtype=torch.long, device=device)
+    for ep in range(epochs):
+        q = model(s)
+        with torch.no_grad():
+            q_next = target(s).max(dim=1).values
+            best_action = q.argmax(dim=1)
+            reward = torch.tensor([dqn_reward(int(a), int(lbl)) for a, lbl in zip(best_action.cpu().numpy(), y.cpu().numpy())], device=device)
+            q_target = reward + gamma * q_next
+        q_pred = q.gather(1, best_action.unsqueeze(1)).squeeze(1)
+        loss = nn.functional.mse_loss(q_pred, q_target)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        if (ep + 1) % 5 == 0:
+            target.load_state_dict(model.state_dict())
+    return model
+
+
+def dqn_to_probability(model: TinyDQN, states: np.ndarray) -> np.ndarray:
+    device = next(model.parameters()).device
+    s = torch.tensor(states, dtype=torch.float32, device=device)
+    with torch.no_grad():
+        q = model(s)
+        probs = torch.softmax(q, dim=1)
+        risk = probs[:, 1] * 0.6 + probs[:, 2]
+    return risk.cpu().numpy()
 def evaluate_scores(y_true, y_prob, thr=0.5):
     y_pred = (y_prob >= thr).astype(int)
     return {
@@ -298,10 +386,16 @@ def main():
 
     vec = TfidfVectorizer(ngram_range=(1, 2), max_features=10000)
     Xtr = vec.fit_transform(data.x_train)
+    Xva = vec.transform(data.x_val)
     Xte = vec.transform(data.x_test)
 
     results = []
     probs = {}
+
+    probs["RULE"] = np.array([rule_based_probability(t) for t in data.x_test], dtype=np.float32)
+    met = evaluate_scores(data.y_test, probs["RULE"])
+    met["Model"] = "RULE"
+    results.append(met)
 
     models = {
         "TFIDF_LR": LogisticRegression(max_iter=400),
@@ -336,6 +430,38 @@ def main():
         met = evaluate_scores(y, p)
         met["Model"] = n
         results.append(met)
+
+    # DQN decision fusion (state uses rule/svm/rf/lstm scores + global features)
+    tr_probs = {
+        "RULE": np.array([rule_based_probability(t) for t in data.x_train], dtype=np.float32),
+        "TFIDF_SVM": models["TFIDF_SVM"].predict_proba(Xtr)[:, 1],
+        "TFIDF_RF": models["TFIDF_RF"].predict_proba(Xtr)[:, 1],
+        "LSTM_base": infer_torch(RiskGatedLSTMClassifier(with_local=False, with_global=False, with_attention=False), train_loader, device)[1] if False else np.zeros(len(data.x_train)),
+        "RiskGatedLSTM_Attn": np.zeros(len(data.x_train)),
+    }
+    # use fitted neural models for train probabilities
+    fitted_base = RiskGatedLSTMClassifier(with_local=False, with_global=False, with_attention=False)
+    fitted_base = train_torch_model("tmp_base", fitted_base, train_loader, val_loader, epochs=1)
+    tr_probs["LSTM_base"] = infer_torch(fitted_base, train_loader, device)[1]
+    fitted_attn = RiskGatedLSTMClassifier(with_local=True, with_global=True, with_attention=True)
+    fitted_attn = train_torch_model("tmp_attn", fitted_attn, train_loader, val_loader, epochs=1)
+    tr_probs["RiskGatedLSTM_Attn"] = infer_torch(fitted_attn, train_loader, device)[1]
+
+    te_probs = {
+        "RULE": probs["RULE"],
+        "TFIDF_SVM": probs["TFIDF_SVM"],
+        "TFIDF_RF": probs["TFIDF_RF"],
+        "LSTM_base": probs["LSTM_base"],
+        "RiskGatedLSTM_Attn": probs["RiskGatedLSTM_Attn"],
+    }
+    dqn_train_states = build_dqn_states(data.x_train, tr_probs)
+    dqn_test_states = build_dqn_states(data.x_test, te_probs)
+    dqn = train_dqn_policy(dqn_train_states, data.y_train)
+    dqn_prob = dqn_to_probability(dqn, dqn_test_states)
+    probs["DQN_Fusion"] = dqn_prob
+    met = evaluate_scores(data.y_test, dqn_prob)
+    met["Model"] = "DQN_Fusion"
+    results.append(met)
 
     df = pd.DataFrame(results)[["Model", "Accuracy", "Precision", "Recall", "F1", "AUC"]]
     df.to_csv("outputs/sql_injection_detection_results.csv", index=False)

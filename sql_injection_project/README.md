@@ -5,7 +5,7 @@
   - `prepared_sql_dataset/sql_train_augmented.csv`
   - `prepared_sql_dataset/sql_val.csv`
   - `prepared_sql_dataset/sql_test.csv`
-- 训练并评估：TF-IDF+LR、TF-IDF+SVM、TF-IDF+RF，以及 Risk-Gated LSTM 系列消融模型。
+- 训练并评估：TF-IDF+LR、TF-IDF+SVM、TF-IDF+RF、RULE 基线、Risk-Gated LSTM 系列消融模型，以及 DQN 决策融合模型。
 - 输出 Accuracy / Precision / Recall / F1 / AUC。
 - 保存结果与图表。
 
